@@ -505,7 +505,7 @@ void build_network(Ctx* c) {
             }
             if (!reused && !build_weights(c->dlssd_path, c->w, err)) throw std::runtime_error("nvngx_dlssd.dll: " + err);
             c->weights_ok = true;
-            g_log("weights rebuilt from %s (version %s) in %.0f ms", c->weights_source.c_str(), c->w.version.c_str(),
+            g_log("weights %s from %s (version %s) in %.0f ms", reused ? "reused" : "rebuilt", c->weights_source.c_str(), c->w.version.c_str(),
                   std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
         }
         auto t0 = std::chrono::steady_clock::now();
@@ -758,24 +758,22 @@ void record_frame(Ctx* c, Rec& r, Job& j, bool network, bool split = false) {
         memcpy(gt.proj, ip.proj, sizeof gt.proj);
         gt.depth_sign = ip.depth_sign;
         ingest = false;
+        const size_t bpp8[8] = {8, 4, 4, 8, 2, 4, 4, 2};
         for (int s = 0; s < 8; ++s) {
             gt.buf[s] = ip.dst[s];
             if (((ip.g[s][2] >> 16) & 12u) != 0) {
                 ip.dst[s] = 0;
-                if (c->use_d3d && c->guides[s].addr && c->guides_dev) c->guides_dev->destroy(c->guides[s]);
             } else {
-                const size_t bpp8[8] = {8, 4, 4, 8, 2, 4, 4, 2};
                 if (!c->guides[s].addr) c->guides[s] = d.create(size_t(c->guide_size.x) * c->guide_size.y * bpp8[s] + 64);
                 ip.dst[s] = gt.buf[s] = c->guides[s].addr;
                 ingest = true;
             }
-            // handled above
         }
     }
     if (ingest) {
         const size_t bpp8[8] = {8, 4, 4, 8, 2, 4, 4, 2};
         for (int s = 0; s < 8; ++s) {
-            if (!direct && (s == G_COLOR || !network ? s == G_COLOR : true) && !c->guides[s].addr)
+            if (!direct && (network || s == G_COLOR) && !c->guides[s].addr)
                 c->guides[s] = d.create(size_t(c->guide_size.x) * c->guide_size.y * bpp8[s] + 64), ip.dst[s] = c->guides[s].addr;
         }
         d.dispatch(r.k[r.ingest], &ip, sizeof ip, div_up(render.x, 16), div_up(render.y, 16));
@@ -1164,17 +1162,23 @@ bool ctx_retired(Ctx* c) {
     return true;
 }
 
+struct RetiredCtx {
+    Ctx* c = nullptr;
+    ULONGLONG tick = 0;
+    uint32_t sweeps = 0;
+};
 std::mutex g_retired_m;
-std::vector<Ctx*> g_retired;
+std::vector<RetiredCtx> g_retired;
 
 void sweep_retired(VkDevice = VK_NULL_HANDLE) {
     std::vector<Ctx*> go;
+    const ULONGLONG now = GetTickCount64();
     {
         std::lock_guard l(g_retired_m);
         size_t keep = 0;
-        for (Ctx* c : g_retired)
-            if (ctx_retired(c)) go.push_back(c);
-            else g_retired[keep++] = c;
+        for (auto& r : g_retired)
+            if (ctx_retired(r.c) || ++r.sweeps >= 64 || now - r.tick >= 2000) go.push_back(r.c);
+            else g_retired[keep++] = r;
         g_retired.resize(keep);
     }
     for (Ctx* c : go) free_ctx(c);
@@ -1186,7 +1190,7 @@ void destroy_ctx(Ctx* c) {
     sweep_retired();
     if (!ctx_retired(c)) {
         std::lock_guard l(g_retired_m);
-        g_retired.push_back(c);
+        g_retired.push_back({c, GetTickCount64(), 0});
         return;
     }
     free_ctx(c);
@@ -1275,9 +1279,12 @@ void create_vk_host(Ctx* c, const OnrRrVkDevice& v) {
     // network beside the main one on another queue is where the GPU timeouts came from, so it shows the scaled colour.
     // ONR_RR_SMALL_VIEWS=1 runs the network there too.
     if (c->out_size.x < 960 && !getenv("ONR_RR_SMALL_VIEWS")) {
-        g_log("output %dx%d: a small secondary view, not running the network (ONR_RR_SMALL_VIEWS=1 runs it)", c->out_size.x,
+        c->small_view = true;
+        c->state = ONR_RR_STATE_READY;
+        c->message = "small secondary view: colour scaled without the network";
+        g_log("output %dx%d: a small secondary view, the colour is scaled without the network (ONR_RR_SMALL_VIEWS=1 runs it)", c->out_size.x,
               c->out_size.y);
-        throw std::runtime_error("output width < 960 is a small secondary view (set ONR_RR_SMALL_VIEWS=1 to force)");
+        return;
     }
     c->message = "building the network";
     start_build(c);
@@ -2210,20 +2217,20 @@ void d3d_plan_direct(Ctx* c, Job& j, std::vector<D3D12_RESOURCE_BARRIER>& back) 
 }
 
 // the job's guides that are not read directly, copied into dinput (one barrier each way), on the bound list
-void d3d_copy_inputs(Ctx* c, const Job& j) {
+void d3d_copy_inputs(Ctx* c, Job& j) {
     const OnrRrTexture* tex[G_COUNT];
     frame_textures(j.f, tex);
     D3dDevice::TexCopy cp[G_COUNT];
     uint32_t n = 0;
-    for (int i = 0; i < G_COUNT; ++i)
-        if (j.in[i].present && !j.in[i].direct)
-            cp[n++] = {static_cast<ID3D12Resource*>(tex[i]->resource), tex[i]->state, j.in[i].offset, j.in[i].pitch, 0, 0};
+    uint64_t compact_off = 0;
+    for (int i = 0; i < G_COUNT; ++i) {
+        if (!j.in[i].present || j.in[i].direct) continue;
+        j.in[i].offset = compact_off;
+        cp[n++] = {static_cast<ID3D12Resource*>(tex[i]->resource), tex[i]->state, compact_off, j.in[i].pitch, 0, 0};
+        compact_off = (compact_off + uint64_t(j.in[i].pitch) * j.in[i].th + 511) & ~uint64_t(511);
+    }
     if (n) {
-        uint64_t end = 0;
-        for (int i = 0; i < G_COUNT; ++i)
-            if (j.in[i].present && !j.in[i].direct)
-                end = std::max<uint64_t>(end, j.in[i].offset + uint64_t(j.in[i].pitch) * j.in[i].th);
-        d3d_ensure(c, c->dinput, (end + 511) & ~uint64_t(511));
+        d3d_ensure(c, c->dinput, compact_off);
         c->dx->copy_textures_to_buffer(cp, n, c->dinput);
     }
 }

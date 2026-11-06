@@ -311,6 +311,7 @@ bool D3dDevice::slot_retired(SlotState& s, uint32_t idx) {
     if (!s.proofs.empty()) return false;
     if (s.has_fence || s.invalidated) return true;
     if (s.host_tracked) return false;
+    if (binds_ - s.serial >= kGameSlots) return true;
     return s.query_count > 0 && done_map_ && done_map_[idx * kSlotQueries + s.query_count - 1] != 0;
 }
 
@@ -328,6 +329,7 @@ bool D3dDevice::overflow_retired(OverflowUpload& o) {
     if (!o.proofs.empty()) return false;
     if (o.has_fence || o.invalidated) return true;
     if (o.host_tracked) return false;
+    if (binds_ - o.serial >= kGameSlots) return true;
     return o.done && *o.done != 0;
 }
 

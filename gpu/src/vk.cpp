@@ -307,6 +307,7 @@ void Device::sweep(bool all) {
     if (!all && dev_) {
         std::erase_if(active_queries_, [&](const QueryProof& q) {
             if (q.serial == current_serial_) return false;
+            if (binds_ - q.serial >= kViewSlots) return true;
             uint64_t ts = 0;
             return vkGetQueryPoolResults(dev_, q.pool, q.query, 1, sizeof(ts), &ts, sizeof(ts), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS;
         });

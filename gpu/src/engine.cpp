@@ -312,7 +312,8 @@ void Engine::drop_transparency_history() {
         if (b.addr) dev_->destroy(b);
     for (auto& b : toh_)
         if (b.addr) dev_->destroy(b);
-    tl_last_ = to_last_ = false;
+    nr_frame_ = ~0ull;
+        tl_last_ = to_last_ = false;
 }
 
 void Engine::destroy() {
@@ -583,8 +584,31 @@ void Engine::record_net(const EngineFrame& f, const Guides& g, uint64_t dfn_out,
         }
         if (wide) {
             const I2 apad = {(alloc_render_.x + 31) & ~31, (alloc_render_.y + 31) & ~31};
-            if (!attr_wide_.addr) attr_wide_ = dev_->create(size_t(apad.x) * apad.y * 64 + 64), sized_.push_back(attr_wide_);
-            a.attr = attr_wide_.addr;
+            const size_t needWide = size_t(apad.x) * apad.y * 64;
+            if (attr_.size < needWide) {
+                const uint64_t oldBase = attr_.addr;
+                Buffer nw = make(needWide);
+                for (auto& sb : sized_) {
+                    if (sb.addr == oldBase) {
+                        dev_->destroy(sb);
+                        sb = nw;
+                        break;
+                    }
+                }
+                attr_ = nw;
+                const uint64_t delta = nw.addr - oldBase;
+                tile_.addr += delta, aniso_.addr += delta, ajab_.addr += delta, mvf_.addr += delta;
+                for (int s = 1; s < 6; ++s) {
+                    enc_l_[s].tensor.addr += delta;
+                    enc_l_[s].dfn.addr += delta;
+                    if (s >= 2) {
+                        enc_l_[s].pooled.addr += delta;
+                        enc_l_[s].dfn_pool.addr += delta;
+                    }
+                }
+                dec1_l_[1].tensor.addr += delta;
+            }
+            attr_wide_ = attr_; a.attr = attr_.addr;
             attr_k += "_w";
         }
     }
