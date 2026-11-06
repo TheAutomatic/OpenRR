@@ -138,15 +138,18 @@ public:
     void set_texture(uint32_t slot, const Image& i, VkSampler s) override;   // call outside begin()/submit()
     // hosted: set 0 of the d3d_ kernels (16 sampled images, then 2 storage images) for the bound recording, one set
     // per ring slot (a slot's set is written again kViewSlots recordings later); set_view fills index 0..17 of it
-    static constexpr uint32_t kViewSlots = 8;
+    static constexpr uint32_t kViewSlots = 64;
     void use_views(uint32_t slot);
     void set_view(uint32_t index, VkImageView view, VkImageLayout layout);
+    bool pool_retired(VkQueryPool q);
+    bool all_retired();
 
     // SPIR-V file -> compute pipeline. All kernels share one layout: 256 bytes of push constants.
     Kernel load(const std::string& spv_path, uint32_t subgroup = 0) override;   // subgroup: required size, 0 = any
     void destroy(Kernel& k) override;
     std::string stats(const Kernel& k);   // compiler statistics (registers, spills), if the driver exposes them
     // the 48 bytes of a combined image sampler descriptor (DeviceOptions::descriptors); false without the extension
+    bool has_descriptors() const { return get_descriptor_ != nullptr; }
     bool combined_descriptor(const Image& im, VkSampler s, uint8_t out[48]);
     // the pipeline ELF the driver builds for this SPIR-V (its "ELF" internal representation); empty when not exposed
     std::vector<uint8_t> pipeline_elf(const std::string& spv_path, uint32_t subgroup);
@@ -166,9 +169,14 @@ public:
 
 private:
     void setup_common();
-    // hosted: destroyed after kGraveBinds more bind() calls (all at once in the destructor)
+    struct QueryProof {
+        VkQueryPool pool = VK_NULL_HANDLE;
+        uint32_t query = 0;
+        uint64_t serial = 0;
+    };
+    // hosted: destroyed only after all in-flight query proofs at bury time complete on the GPU
     struct Grave {
-        uint64_t at = 0;
+        std::vector<uint64_t> wait_serials;
         VkBuffer buf = VK_NULL_HANDLE;
         VkDeviceMemory mem = VK_NULL_HANDLE;
         VkImage img = VK_NULL_HANDLE;
@@ -176,8 +184,9 @@ private:
         VkPipeline pipe = VK_NULL_HANDLE;
         VkShaderModule module = VK_NULL_HANDLE;
         VkDescriptorSet set = VK_NULL_HANDLE;
+        VkDescriptorSet vset = VK_NULL_HANDLE;
+        VkQueryPool qpool = VK_NULL_HANDLE;
     };
-    static constexpr uint64_t kGraveBinds = 16;
     void bury(const Grave& g);
     void sweep(bool all);
     void one_shot_copy(VkBuffer src, VkBuffer dst, VkDeviceSize src_off, VkDeviceSize dst_off, VkDeviceSize size);
@@ -215,9 +224,12 @@ private:
     PFN_vkGetCalibratedTimestampsEXT calibrated_ = nullptr;
     PFN_vkGetDescriptorEXT get_descriptor_ = nullptr;
     bool hosted_ = false;
+    bool host_query_reset_ = false;
     std::vector<uint32_t> families_;          // hosted: the buffers' and images' concurrent queue families
+    std::vector<QueryProof> active_queries_;
     std::vector<Grave> grave_;
     uint64_t binds_ = 0;
+    uint64_t current_serial_ = 0;
     uint64_t bytes_ = 0;
     bool budget_ = false;                     // the GPU offers VK_EXT_memory_budget
     bool set_bound_ = false;                  // hosted: set_ was bound by a dispatch since it was written

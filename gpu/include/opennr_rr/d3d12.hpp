@@ -39,24 +39,35 @@ void root_constants(const void* push, uint32_t size, uint32_t* rc);
 
 class D3dDevice : public Gpu {
 public:
-    static constexpr uint32_t kSlots = 8;          // recordings in flight (upload ring, timestamps)
+    static constexpr uint32_t kSlots = 64;         // recordings in flight (0..kGameSlots-1 game lists, kOwnSlot own_)
+    static constexpr uint32_t kGameSlots = kSlots - 1;
+    static constexpr uint32_t kOwnSlot = kSlots - 1;
+    static constexpr uint32_t kOverflowDescSlots = 64;
     static constexpr uint32_t kSlotQueries = 192;  // timestamps per recording
     static constexpr uint32_t kSlotViews = 18;     // set 0 of the d3d_ kernels per recording: 16 SRVs, then 2 UAVs
     static constexpr uint32_t kTableViews = 12;    // set 0 of the others: 8 combined image samplers of 48 bytes
+    static constexpr uint32_t kSlotStride = kSlotViews + kTableViews;
 
     ~D3dDevice() override;
     // dev: the game's device (kept referenced). compiler: the Vulkan device on the same adapter that builds the
     // pipeline ELFs (outlives this one). cache_dir: where built ELFs are kept between runs (empty: no cache).
     bool init(ID3D12Device* dev, Device* compiler, const std::wstring& cache_dir, std::string& err);
     ID3D12Device* d3d() const { return dev_; }
+    uint64_t bytes() const { return bytes_; }
+    bool vram(uint64_t& used, uint64_t& budget) const;
     uint64_t timestamp_frequency() const { return ts_freq_; }
     // ELFs taken from the cache / built since init
     uint32_t cache_hits() const { return hits_; }
     uint32_t cache_misses() const { return misses_; }
 
     // Recording into cl until unbind(): ring slot `slot` (upload memory, timestamps). unbind resolves the timestamps.
-    void bind(ID3D12GraphicsCommandList* cl, uint32_t slot);
+    uint64_t bind(ID3D12GraphicsCommandList* cl, uint32_t slot);
     void unbind();
+    uint32_t bound_slot() const { return slot_; }
+    bool using_overflow() const { return using_overflow_; }
+    void note_fence(uint64_t serial, ID3D12Fence* fence, uint64_t value);
+    void note_invalidated(uint64_t serial);
+    bool all_retired();
     ID3D12GraphicsCommandList* list() const { return cl_; }
     // views of the game's textures in the bound recording's descriptor table (set 0 of the d3d_ kernels, its low
     // address in root constant 61). False without a table: the descriptor size is not the 32 bytes the ELFs assume.
@@ -79,6 +90,7 @@ public:
 
     Buffer create(VkDeviceSize size) override;
     void destroy(Buffer& b) override;
+    void destroy_raw(IUnknown* u) { bury(u); }
     void upload(const Buffer& b, const void* src, VkDeviceSize size, VkDeviceSize off = 0) override;
     void download(const Buffer& b, void* dst, VkDeviceSize size, VkDeviceSize off = 0) override;
     void fill(const Buffer& b, uint32_t value) override;
@@ -126,18 +138,57 @@ private:
     ID3D12GraphicsCommandList* own_ = nullptr;
     ID3D12Fence* fence_ = nullptr;
     uint64_t fv_ = 0;
+    struct FenceProof {
+        ID3D12Fence* fence = nullptr;
+        uint64_t value = 0;
+    };
+    struct SlotState {
+        uint64_t serial = 0;
+        bool own = false;
+        uint64_t own_fv = 0;
+        bool host_tracked = false;
+        bool has_fence = false;
+        bool invalidated = true;
+        uint32_t query_count = 0;
+        std::vector<FenceProof> proofs;
+    };
+    struct OverflowUpload {
+        uint64_t serial = 0;
+        uint32_t desc_slot = 0;
+        ID3D12Resource* ring = nullptr;
+        uint8_t* map = nullptr;
+        ID3D12QueryHeap* qh = nullptr;
+        ID3D12Resource* qrb = nullptr;
+        volatile uint64_t* done = nullptr;
+        bool host_tracked = false;
+        bool has_fence = false;
+        bool invalidated = true;
+        std::vector<FenceProof> proofs;
+    };
+    struct Grave {
+        std::vector<uint64_t> wait_serials;
+        IUnknown* obj = nullptr;
+    };
     ID3D12Resource* ring_ = nullptr;   // upload heap, kSlots regions
     uint8_t* ring_map_ = nullptr;
+    ID3D12Resource* cur_ring_ = nullptr;
+    uint8_t* cur_ring_map_ = nullptr;
     uint64_t ring_off_ = 0, ring_end_ = 0;
+    volatile uint64_t* done_map_ = nullptr;
+    SlotState slots_[kSlots] = {};
+    std::vector<OverflowUpload> overflow_;
+    uint64_t current_serial_ = 0;
+    bool using_overflow_ = false;
     ID3D12QueryHeap* qh_ = nullptr;
     ID3D12Resource* qrb_ = nullptr;    // readback of the timestamps
     uint64_t ts_freq_ = 1;
     ID3D12GraphicsCommandList* cl_ = nullptr;
-    uint32_t slot_ = 0, nquery_ = 0;
+    uint32_t slot_ = 0, desc_slot_ = 0, overflow_cursor_ = 0, nquery_ = 0;
     ID3D12DescriptorHeap* heap_ = nullptr;
     uint64_t heap_cpu_ = 0, heap_gpu_ = 0;
     uint32_t desc_lo_ = 0;             // root constant 61 of the bound recording (d3d_ kernels)
-    uint32_t table_lo_ = 0;            // root constant 61 of the others
+    uint32_t table_lo_ = 0;            // root constant 61 of the others (per-slot snapshot)
+    uint8_t tex_table_[8][48] = {};
     std::unique_ptr<Device> srd_;      // descriptors of linear images (alias_image)
     bool srd_ok_ = false;
     std::map<uint64_t, std::array<uint8_t, 48>> images_;
@@ -147,9 +198,13 @@ private:
     const Kernel* bound_ = nullptr;
     std::mutex own_m_;
     uint32_t hits_ = 0, misses_ = 0;
-    // released kSlots + 2 recordings after destroy(): a list of the game may still use them
-    std::vector<std::pair<uint64_t, IUnknown*>> grave_;
+    std::vector<Grave> grave_;
     uint64_t binds_ = 0;
+    uint64_t bytes_ = 0;
+    bool slot_retired(SlotState& s, uint32_t idx);
+    bool overflow_retired(OverflowUpload& o);
+    bool serial_retired(uint64_t serial);
+    void reap(bool all = false);
     void bury(IUnknown* u);
 };
 

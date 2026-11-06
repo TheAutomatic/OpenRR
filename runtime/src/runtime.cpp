@@ -48,6 +48,7 @@ thread_local std::string t_error;
 // keeps its barrier, and on a Vulkan game's device always (its features come and go with others in flight).
 // ONR_RR_FLOW=0: never, =1: always (measurements).
 std::atomic<int> g_live{0};
+std::atomic<bool> g_abi6_host{false};
 const char* const g_flow = getenv("ONR_RR_FLOW");
 
 int32_t fail(int32_t code, const std::string& what) {
@@ -345,6 +346,7 @@ struct Job {
     OnrRrFrame f{};
     Copy in[G_COUNT];
     std::shared_ptr<SharedBuffer> input, output, image;
+    UINT64 out_bytes = 0;
     UINT out_pitch = 0;
     Tf out_tf = TF_NONE;
     bool enqueued = false, output_recorded = false;
@@ -431,6 +433,7 @@ struct Ctx {
     bool logged_ray = false;
     GuideStats stats[2];               // disocclusion mask, SSS guide
     std::shared_ptr<std::atomic<bool>> stats_busy = std::make_shared<std::atomic<bool>>(false);   // a summing thread runs
+    std::thread stats_thread;
     uint64_t stats_seq = 0;            // the frame their copies were recorded on
     ULONGLONG stats_tick = 0;
     // D3D12 backend (ABI 4): the game's device, its own kernels and buffers; d3d says it runs the frames
@@ -446,7 +449,7 @@ struct Ctx {
     // Vulkan host backend (ABI 5): dev is the game's device, the frames recorded into its command buffers
     bool vk_host = false;
     bool small_view = false;           // Vulkan host: a secondary view's feature, the colour scaled without the network
-    static constexpr uint32_t kHostSlots = 8;
+    static constexpr uint32_t kHostSlots = 64;
     VkQueryPool hqp[kHostSlots] = {};
     uint32_t hq[kHostSlots] = {}, hqnet[kHostSlots][2] = {};
     uint64_t hrecords = 0;
@@ -483,12 +486,24 @@ void load_flow(Kernels& k, Gpu& d, const std::wstring& dir) {
 
 void build_lite(Ctx* c);
 
+std::mutex g_cached_weights_m;
+std::wstring g_cached_dlssd_path;
+Weights g_cached_weights;
+
 void build_network(Ctx* c) {
     try {
         if (!c->weights_ok) {
             auto t0 = std::chrono::steady_clock::now();
             std::string err;
-            if (!build_weights(c->dlssd_path, c->w, err)) throw std::runtime_error("nvngx_dlssd.dll: " + err);
+            bool reused = false;
+            {
+                std::lock_guard wl(g_cached_weights_m);
+                if (!g_cached_dlssd_path.empty() && g_cached_dlssd_path == c->dlssd_path && !g_cached_weights.version.empty()) {
+                    c->w = g_cached_weights;
+                    reused = true;
+                }
+            }
+            if (!reused && !build_weights(c->dlssd_path, c->w, err)) throw std::runtime_error("nvngx_dlssd.dll: " + err);
             c->weights_ok = true;
             g_log("weights rebuilt from %s (version %s) in %.0f ms", c->weights_source.c_str(), c->w.version.c_str(),
                   std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
@@ -515,8 +530,8 @@ void build_network(Ctx* c) {
                 g_log("network kernels ready on D3D12 (%zu pipelines: %u ELFs from the cache, %u built) in %.1f s", names.size(), c->dx->cache_hits() - h0, c->dx->cache_misses() - m0,
                       std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
             } catch (const std::exception& e) {
-                k.unload(*c->dx);
                 std::lock_guard l(c->m);
+                k.unload(*c->dx);
                 // the network never ran on D3D12 here: the frames simply go to Vulkan from now on
                 if (c->engine_ready) throw;
                 c->use_d3d = false;
@@ -566,7 +581,7 @@ void build_lite(Ctx* c) {
               std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
         c->lite_built = true;
     } catch (const std::exception& e) {
-        c->net_lite.unload(d);
+        { std::lock_guard l(c->m); c->net_lite.unload(d); }
         c->lite_failed = true;
         g_log("fast mode not available: %s", e.what());
     }
@@ -584,17 +599,19 @@ Buffer make_buffer(Gpu& d, size_t n) {
     return b;
 }
 
-// the guides in the kernels' formats, on the device that runs the frames
+// the guides in the kernels' formats, on the device that runs the frames (preallocated up to max_render for DRS)
 void ensure_guides(Ctx* c, Gpu& d, I2 render) {
-    if (c->guides_dev == &d && c->guide_size.x == render.x && c->guide_size.y == render.y) return;
+    I2 cap{std::max({render.x, c->max_render.x, c->guide_size.x}),
+           std::max({render.y, c->max_render.y, c->guide_size.y})};
+    if (c->guides_dev == &d && cap.x <= c->guide_size.x && cap.y <= c->guide_size.y) return;
     if (c->guides_dev)
         for (auto& b : c->guides)
             if (b.addr) c->guides_dev->destroy(b);
-    size_t px = size_t(render.x) * render.y;
+    size_t px = size_t(cap.x) * cap.y;
     const size_t bpp[G_COUNT] = {8, 4, 4, 8, 2, 4, 4, 2, 0, 8, 4, 4};   // the rest: on their first frame (record_frame)
     for (int i = 0; i < G_COUNT; ++i)
-        if (bpp[i]) c->guides[i] = make_buffer(d, px * bpp[i]);
-    c->guide_size = render;
+        if (bpp[i] && !(c->use_d3d && c->direct_ok)) c->guides[i] = make_buffer(d, px * bpp[i]);
+    c->guide_size = cap;
     c->guides_dev = &d;
 }
 
@@ -669,6 +686,7 @@ struct Rec {
 };
 
 void record_pack(Ctx* c, Rec& r, Job& j) {
+    if (!c->out16.addr) c->out16 = r.d.create(size_t(c->out_size.x) * c->out_size.y * 8 + 64);
     r.d.barrier();
     PackPC pk{c->out16.addr, r.output, c->out_size, c->out_size, r.out_fmt ? r.out_pitch : j.out_pitch, r.out_fmt ? r.out_fmt : uint32_t(j.out_tf)};
     r.d.dispatch(r.k[r.pack], &pk, sizeof pk, div_up(c->out_size.x, 16), div_up(c->out_size.y, 16));
@@ -682,12 +700,16 @@ void record_post(Ctx* c, Rec& r, Job& j, Tf edited) {
         in = DfnImport{r.image, (j.f.render_width * tf_bytes(edited) + 255) & ~255u, uint32_t(edited)};
         edit = j.edit == ONR_RR_EDIT_DISPLAY ? DfnEdit::display : DfnEdit::loop;
     }
+    const bool img = r.out_fmt && c->engine.output_image_ok();
+    c->engine.set_output_image(img);
+    if (!img && !c->out16.addr) c->out16 = r.d.create(size_t(c->out_size.x) * c->out_size.y * 8 + 64);
     r.qnet[0] = r.d.queries();
     r.d.stamp();
-    c->engine.record_post(engine_frame(c, j), c->out16.addr, edit, in);
+    c->engine.record_post(engine_frame(c, j), img ? uint64_t(r.out_pitch) : c->out16.addr, edit, in);
+    c->engine.set_output_image(false);
     r.d.stamp();
     r.qnet[1] = r.d.queries();
-    record_pack(c, r, j);
+    if (!img) record_pack(c, r, j);
 }
 
 // ONR_RR_DIRECT_GUIDES=0 (measurements): the ingest writes the guides even where the network can read them itself
@@ -738,11 +760,26 @@ void record_frame(Ctx* c, Rec& r, Job& j, bool network, bool split = false) {
         ingest = false;
         for (int s = 0; s < 8; ++s) {
             gt.buf[s] = ip.dst[s];
-            if (((ip.g[s][2] >> 16) & 12u) != 0) ip.dst[s] = 0;
-            else ingest = true;
+            if (((ip.g[s][2] >> 16) & 12u) != 0) {
+                ip.dst[s] = 0;
+                if (c->use_d3d && c->guides[s].addr && c->guides_dev) c->guides_dev->destroy(c->guides[s]);
+            } else {
+                const size_t bpp8[8] = {8, 4, 4, 8, 2, 4, 4, 2};
+                if (!c->guides[s].addr) c->guides[s] = d.create(size_t(c->guide_size.x) * c->guide_size.y * bpp8[s] + 64);
+                ip.dst[s] = gt.buf[s] = c->guides[s].addr;
+                ingest = true;
+            }
+            // handled above
         }
     }
-    if (ingest) d.dispatch(r.k[r.ingest], &ip, sizeof ip, div_up(render.x, 16), div_up(render.y, 16));
+    if (ingest) {
+        const size_t bpp8[8] = {8, 4, 4, 8, 2, 4, 4, 2};
+        for (int s = 0; s < 8; ++s) {
+            if (!direct && (s == G_COLOR || !network ? s == G_COLOR : true) && !c->guides[s].addr)
+                c->guides[s] = d.create(size_t(c->guide_size.x) * c->guide_size.y * bpp8[s] + 64), ip.dst[s] = c->guides[s].addr;
+        }
+        d.dispatch(r.k[r.ingest], &ip, sizeof ip, div_up(render.x, 16), div_up(render.y, 16));
+    }
     if (network) {
         // the optional guides the game gave, in dispatches of their own (eight slots each, the others without a
         // destination): the transparency layer, ColorBeforeTransparency and the layer's opacity as rgba16f, the
@@ -810,6 +847,7 @@ void record_frame(Ctx* c, Rec& r, Job& j, bool network, bool split = false) {
         // straight into the output texture: the downsample writes it, no pack
         const bool img = r.out_fmt && c->engine.output_image_ok();
         c->engine.set_output_image(img);
+        if (!img && !c->out16.addr) c->out16 = d.create(size_t(c->out_size.x) * c->out_size.y * 8 + 64);
         c->engine.record(ef, g, img ? uint64_t(r.out_pitch) : c->out16.addr);
         c->engine.set_output_image(false);
         d.stamp();
@@ -965,11 +1003,12 @@ bool prepare_network(Ctx* c, Gpu& d, I2 render, F&& idle) {
     if (network && (c->engine.render().x != render.x || c->engine.render().y != render.y || c->engine.output().x != c->out_size.x ||
                     c->engine.output().y != c->out_size.y)) {
         idle();
-        c->engine.resize(render, c->out_size);
-        if (!c->out16.addr) c->out16 = make_buffer(d, size_t(c->out_size.x) * c->out_size.y * 8);
+        c->engine.resize(render, c->out_size, {std::max(render.x, c->max_render.x), std::max(render.y, c->max_render.y)});
+        if (!(c->use_d3d && c->direct_ok && c->engine.output_image_ok()) && !c->out16.addr)
+            c->out16 = make_buffer(d, size_t(c->out_size.x) * c->out_size.y * 8);
         g_log("network sized: render %dx%d (grid %dx%d), output %dx%d, internal %dx%d", render.x, render.y, (render.x + 31) & ~31,
               (render.y + 31) & ~31, c->out_size.x, c->out_size.y, c->out_size.x * 3 / 2, c->out_size.y * 3 / 2);
-        if (c->vk_host) log_vram(c);
+        if (c->vk_host || c->use_d3d) log_vram(c);
     }
     ensure_guides(c, d, render);
     return network;
@@ -979,11 +1018,13 @@ bool prepare_network(Ctx* c, Gpu& d, I2 render, F&& idle) {
 void log_vram(Ctx* c) {
     uint64_t used = 0, budget = 0;
     const double mb = 1.0 / (1 << 20);
-    if (c->dev.vram(used, budget))
-        g_log("VRAM: this feature %.0f MB (%d features alive); the game's process %.0f MB of a %.0f MB budget%s", double(c->dev.bytes()) * mb,
+    const double self_bytes = double(c->use_d3d && c->dx ? c->dx->bytes() : c->dev.bytes());
+    const bool has_vram = c->use_d3d && c->dx ? c->dx->vram(used, budget) : c->dev.vram(used, budget);
+    if (has_vram)
+        g_log("VRAM: this feature %.0f MB (%d features alive); the game's process %.0f MB of a %.0f MB budget%s", self_bytes * mb,
               g_live.load(), double(used) * mb, double(budget) * mb, used > budget ? " (over it: the driver pages, frames slow down)" : "");
     else
-        g_log("VRAM: this feature %.0f MB (%d features alive)", double(c->dev.bytes()) * mb, g_live.load());
+        g_log("VRAM: this feature %.0f MB (%d features alive)", self_bytes * mb, g_live.load());
 }
 
 void log_frame(Ctx* c, I2 render) {
@@ -1050,33 +1091,41 @@ int32_t enqueue(Ctx* c, Job& j, ID3D12CommandQueue* q, uint32_t* exported = null
     return ONR_RR_OK;
 }
 
-void free_ctx(Ctx* c) {
+void teardown_ctx_resources(Ctx* c) {
     if (c->builder.joinable()) c->builder.join();
     if (c->lite_builder.joinable()) c->lite_builder.join();
-    // the game's own device is idle at Destroy (the host's contract); waiting on it would race the game's queues
+    if (c->stats_thread.joinable()) c->stats_thread.join();
     if (c->dev.vk() && !c->vk_host) vkDeviceWaitIdle(c->dev.vk());
     c->engine.destroy();
-    // the network was built on D3D12 only while that backend stayed on
-    Gpu& net = c->use_d3d ? static_cast<Gpu&>(*c->dx) : c->dev;
-    c->net_lite.unload(net);
-    c->net.unload(net);
-    c->kern.unload(c->dev);
-    VkDevice v = c->dev.vk();
+    if (c->dx || c->dev.vk()) {
+        Gpu& net = c->use_d3d ? static_cast<Gpu&>(*c->dx) : c->dev;
+        c->net_lite.unload(net);
+        c->net.unload(net);
+        if (c->out16.addr) net.destroy(c->out16);
+    }
+    if (c->dev.vk()) c->kern.unload(c->dev);
     for (auto& b : c->guides)
         if (b.addr && c->guides_dev) c->guides_dev->destroy(b);
-    if (c->out16.addr) net.destroy(c->out16);
     if (c->dx) {
         c->dkern.unload(*c->dx);
         for (Buffer* b : {&c->dinput, &c->doutput, &c->dimage})
             if (b->addr) c->dx->destroy(*b);
-        // the game's queue may still run lists we recorded into: their resources go a while later
-        std::thread([d = c->dx.release()] {
-            Sleep(2000);
-            delete d;
-        }).detach();
+        for (int k = 0; k < 2; ++k)
+            if (c->stats[k].rb) {
+                c->dx->destroy_raw(c->stats[k].rb);
+                c->stats[k].rb = nullptr;
+            }
     }
-    for (Buffer* b : {&c->vinput, &c->voutput})
-        if (b->addr) c->dev.destroy(*b);
+    if (c->dev.vk()) {
+        for (Buffer* b : {&c->vinput, &c->voutput})
+            if (b->addr) c->dev.destroy(*b);
+    }
+}
+
+void free_ctx(Ctx* c) {
+    teardown_ctx_resources(c);
+    c->dx.reset();
+    VkDevice v = c->dev.vk();
     for (VkQueryPool q : c->hqp)
         if (q) vkDestroyQueryPool(v, q, nullptr);
     for (int s = 0; s < kSubmits; ++s) {
@@ -1090,50 +1139,57 @@ void free_ctx(Ctx* c) {
     for (auto& b : c->retired) b->release(v);
     c->toVk.release(v);
     c->fromVk.release(v);
-    if (c->stats[0].rb || c->stats[1].rb)
-        std::thread([a = c->stats[0].rb, b = c->stats[1].rb] {
-            Sleep(2000);
-            if (a) a->Release();
-            if (b) b->Release();
-        }).detach();
+    for (int k = 0; k < 2; ++k)
+        if (c->stats[k].rb) {
+            c->stats[k].rb->Release();
+            c->stats[k].rb = nullptr;
+        }
     if (c->d3d) c->d3d->Release();
     delete c;
 }
 
-// A context on a Vulkan game's device is freed only after kRetireRecords more recordings on that device: a game may
-// release a feature with command buffers that use it recorded but not yet run. Without more recordings it stays
-// (a few hundred MB until the game closes, when RR goes off for good).
-constexpr uint32_t kRetireRecords = 32;
-struct Retired {
-    VkDevice dev;
-    Ctx* c;
-    uint32_t records;
-};
-std::mutex g_retired_m;
-std::vector<Retired> g_retired;
-
-void destroy_ctx(Ctx* c) {
-    --g_live;
+bool ctx_retired(Ctx* c) {
+    if (c->stats_busy && c->stats_busy->load()) return false;
+    if (c->use_d3d && c->dx && !c->dx->all_retired()) return false;
     if (c->vk_host && c->dev.vk()) {
-        std::lock_guard l(g_retired_m);
-        g_retired.push_back({c->dev.vk(), c, 0});
-        return;
+        if (!c->dev.all_retired()) return false;
+        for (size_t s = 0; s < Ctx::kHostSlots; ++s) {
+            if (!c->hq[s] || !c->hqp[s]) continue;
+            uint64_t ts = 0;
+            if (vkGetQueryPoolResults(c->dev.vk(), c->hqp[s], c->hq[s] - 1, 1, sizeof(ts), &ts, sizeof(ts), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
+                return false;
+            c->hq[s] = 0;
+        }
     }
-    free_ctx(c);
+    return true;
 }
 
-// a recording on device d: retired contexts there one recording closer to going
-void sweep_retired(VkDevice d) {
+std::mutex g_retired_m;
+std::vector<Ctx*> g_retired;
+
+void sweep_retired(VkDevice = VK_NULL_HANDLE) {
     std::vector<Ctx*> go;
     {
         std::lock_guard l(g_retired_m);
         size_t keep = 0;
-        for (auto& r : g_retired)
-            if (r.dev == d && ++r.records >= kRetireRecords) go.push_back(r.c);
-            else g_retired[keep++] = r;
+        for (Ctx* c : g_retired)
+            if (ctx_retired(c)) go.push_back(c);
+            else g_retired[keep++] = c;
         g_retired.resize(keep);
     }
     for (Ctx* c : go) free_ctx(c);
+}
+
+void destroy_ctx(Ctx* c) {
+    --g_live;
+    teardown_ctx_resources(c);
+    sweep_retired();
+    if (!ctx_retired(c)) {
+        std::lock_guard l(g_retired_m);
+        g_retired.push_back(c);
+        return;
+    }
+    free_ctx(c);
 }
 
 std::string gpu_reason(const Device& d) {
@@ -1160,6 +1216,9 @@ int32_t Check(const void* luid, const wchar_t* dlssd) {
         if (dlssd) {
             Weights w;
             if (!build_weights(dlssd, w, err)) return fail(ONR_RR_UNSUPPORTED, "nvngx_dlssd.dll: " + err);
+            std::lock_guard wl(g_cached_weights_m);
+            g_cached_dlssd_path = dlssd;
+            g_cached_weights = std::move(w);
         }
         return ONR_RR_OK;
     } catch (const std::exception& e) {
@@ -1204,11 +1263,11 @@ void create_vk_host(Ctx* c, const OnrRrVkDevice& v) {
     } catch (const std::exception& e) {
         g_log("Vulkan host backend: guides and output copied (%s)", e.what());
     }
-    for (auto& q : c->hqp) {
+    for (uint32_t s = 0; s < 8; ++s) {
         VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
         qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
         qi.queryCount = kMaxQueries;
-        if (vkCreateQueryPool(c->dev.vk(), &qi, nullptr, &q) != VK_SUCCESS) throw std::runtime_error("vkCreateQueryPool");
+        if (vkCreateQueryPool(c->dev.vk(), &qi, nullptr, &c->hqp[s]) != VK_SUCCESS) throw std::runtime_error("vkCreateQueryPool");
     }
     g_log("backend: Vulkan host (the game's device), kernels recorded into the game's command buffer");
     c->state = ONR_RR_STATE_BUILDING;
@@ -1216,11 +1275,9 @@ void create_vk_host(Ctx* c, const OnrRrVkDevice& v) {
     // network beside the main one on another queue is where the GPU timeouts came from, so it shows the scaled colour.
     // ONR_RR_SMALL_VIEWS=1 runs the network there too.
     if (c->out_size.x < 960 && !getenv("ONR_RR_SMALL_VIEWS")) {
-        c->small_view = true;
-        c->message = "small view: the colour scaled, no network";
-        g_log("output %dx%d: a small secondary view, the colour is scaled without the network (ONR_RR_SMALL_VIEWS=1 runs it)", c->out_size.x,
+        g_log("output %dx%d: a small secondary view, not running the network (ONR_RR_SMALL_VIEWS=1 runs it)", c->out_size.x,
               c->out_size.y);
-        return;
+        throw std::runtime_error("output width < 960 is a small secondary view (set ONR_RR_SMALL_VIEWS=1 to force)");
     }
     c->message = "building the network";
     start_build(c);
@@ -1258,6 +1315,7 @@ int32_t Create(const OnrRrCreateInfo* in, void** out) {
         DeviceOptions o;
         o.luid = reinterpret_cast<const uint8_t*>(&luid);
         o.interop = true;
+        o.descriptors = true;
         std::string err;
         if (!c->dev.init(err, o)) throw std::runtime_error("Vulkan: " + err);
         // timestamps only at the submit's boundaries: one around every dispatch serialises the ones without a barrier
@@ -1426,13 +1484,14 @@ void stats_read(Ctx* c, uint64_t seq) {
     for (int k = 0; k < 2; ++k)
         if (g[k].pending) g[k].rb->AddRef();
     c->stats[0].pending = c->stats[1].pending = false;
+    if (c->stats_thread.joinable()) c->stats_thread.join();
     c->stats_busy->store(true);
-    std::thread([g0 = g[0], g1 = g[1], seq = c->stats_seq, busy = c->stats_busy] {
+    c->stats_thread = std::thread([g0 = g[0], g1 = g[1], seq = c->stats_seq, busy = c->stats_busy] {
         const GuideStats g[2] = {g0, g1};
         for (int k = 0; k < 2; ++k)
             if (g[k].pending) stats_sum(g[k], k, seq), g[k].rb->Release();
         busy->store(false);
-    }).detach();
+    });
 }
 
 void stats_record(Ctx* c, const Job& j, ID3D12GraphicsCommandList* cl) {
@@ -1585,7 +1644,7 @@ int32_t plan_job(Ctx* c, const OnrRrFrame* f, std::unique_ptr<Job>& j, D3D12_PLA
         if (oi->width < uint32_t(c->out_size.x) || oi->height < uint32_t(c->out_size.y))
             return fail(ONR_RR_INVALID_ARGUMENT, "the output image is smaller than the output size given at Create");
         j->out_pitch = (uint32_t(c->out_size.x) * tf_bytes(j->out_tf) + 255) & ~255u;
-        obytes = UINT64(j->out_pitch) * uint32_t(c->out_size.y);
+        j->out_bytes = obytes = UINT64(j->out_pitch) * uint32_t(c->out_size.y);
         return ONR_RR_OK;
     }
     auto* outr = static_cast<ID3D12Resource*>(f->output.resource);
@@ -1598,6 +1657,7 @@ int32_t plan_job(Ctx* c, const OnrRrFrame* f, std::unique_ptr<Job>& j, D3D12_PLA
     box.Width = UINT64(c->out_size.x), box.Height = UINT(c->out_size.y);
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT ofp{};
     c->d3d->GetCopyableFootprints(&box, 0, 1, 0, &ofp, nullptr, nullptr, &obytes);
+    j->out_bytes = obytes;
     j->out_pitch = ofp.Footprint.RowPitch;
     return ONR_RR_OK;
 }
@@ -2047,25 +2107,27 @@ void d3d_setup(Ctx* c) {
     c->dx = std::move(dx);
 }
 
-// a D3D12 recording's times, kSlots recordings later: the network's span and the parts around it
-void d3d_harvest(Ctx* c, uint32_t slot) {
-    const uint32_t n = c->dq[slot];
-    c->dq[slot] = 0;
-    if (n < 2) return;
-    std::vector<uint64_t> ts(n);
-    if (!c->dx->read_stamps(slot, ts)) return;
+// a D3D12 recording's times once its slot retired: the network's span and the parts around it
+void d3d_harvest(Ctx* c) {
     const double ms = 1000.0 / double(c->dx->timestamp_frequency());
-    add_gaps(c, ts, ms);
-    const uint32_t a = c->dqnet[slot][0], b = c->dqnet[slot][1];
-    if (b > a && b <= n) {
-        c->split[0] += float(double(ts[a] - ts.front()) * ms);
-        c->split[1] += float(double(ts[b - 1] - ts[a]) * ms);
-        c->split[2] += float(double(ts.back() - ts[b - 1]) * ms);
-        ++c->split_n;
+    for (uint32_t slot = 0; slot < D3dDevice::kSlots; ++slot) {
+        const uint32_t n = c->dq[slot];
+        if (n < 2) continue;
+        std::vector<uint64_t> ts(n);
+        if (!c->dx->read_stamps(slot, ts)) continue;
+        c->dq[slot] = 0;
+        add_gaps(c, ts, ms);
+        const uint32_t a = c->dqnet[slot][0], b = c->dqnet[slot][1];
+        if (b > a && b <= n) {
+            c->split[0] += float(double(ts[a] - ts.front()) * ms);
+            c->split[1] += float(double(ts[b - 1] - ts[a]) * ms);
+            c->split[2] += float(double(ts.back() - ts[b - 1]) * ms);
+            ++c->split_n;
+        }
+        c->gpu_last = float(double(ts.back() - ts.front()) * ms);
+        c->gpu_hist.push_back(c->gpu_last);
+        if (c->gpu_hist.size() > 64) c->gpu_hist.erase(c->gpu_hist.begin());
     }
-    c->gpu_last = float(double(ts.back() - ts.front()) * ms);
-    c->gpu_hist.push_back(c->gpu_last);
-    if (c->gpu_hist.size() > 64) c->gpu_hist.erase(c->gpu_hist.begin());
 }
 
 // a D3D12 buffer of at least n bytes, kept for larger frames
@@ -2078,20 +2140,34 @@ void d3d_ensure(Ctx* c, Buffer& b, UINT64 n) {
 // The typed view d3d_ingest reads a guide through, or UNKNOWN when its texel fetch might not give the bits tf_read
 // gives: float formats convert exactly; 8-bit unorm only into the albedos, which pack it back to the same bytes.
 DXGI_FORMAT direct_view(DXGI_FORMAT f, int slot) {
+    (void)slot;
     switch (f) {
     case DXGI_FORMAT_R16G16B16A16_TYPELESS: case DXGI_FORMAT_R16G16B16A16_FLOAT: return DXGI_FORMAT_R16G16B16A16_FLOAT;
     case DXGI_FORMAT_R32G32B32A32_TYPELESS: case DXGI_FORMAT_R32G32B32A32_FLOAT: return DXGI_FORMAT_R32G32B32A32_FLOAT;
     case DXGI_FORMAT_R11G11B10_FLOAT: return DXGI_FORMAT_R11G11B10_FLOAT;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: case DXGI_FORMAT_R10G10B10A2_UNORM: return DXGI_FORMAT_R10G10B10A2_UNORM;
     case DXGI_FORMAT_R16G16_TYPELESS: case DXGI_FORMAT_R16G16_FLOAT: return DXGI_FORMAT_R16G16_FLOAT;
     case DXGI_FORMAT_R32G32_TYPELESS: case DXGI_FORMAT_R32G32_FLOAT: return DXGI_FORMAT_R32G32_FLOAT;
     case DXGI_FORMAT_R16_TYPELESS: case DXGI_FORMAT_R16_FLOAT: return DXGI_FORMAT_R16_FLOAT;
-    case DXGI_FORMAT_R32_TYPELESS: case DXGI_FORMAT_R32_FLOAT: case DXGI_FORMAT_D32_FLOAT: return DXGI_FORMAT_R32_FLOAT;
-    case DXGI_FORMAT_R32G8X24_TYPELESS: case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+    case DXGI_FORMAT_R32_TYPELESS: case DXGI_FORMAT_R32_FLOAT: return DXGI_FORMAT_R32_FLOAT;
+    case DXGI_FORMAT_R32G8X24_TYPELESS: case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
         return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
-    case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM:
-        return slot == G_ALBEDO || slot == G_SPEC ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_UNKNOWN;
-    case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8A8_UNORM:
-        return slot == G_ALBEDO || slot == G_SPEC ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_UNKNOWN;
+    case DXGI_FORMAT_R24G8_TYPELESS: case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+        return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    case DXGI_FORMAT_R8_TYPELESS: case DXGI_FORMAT_R8_UNORM: return DXGI_FORMAT_R8_UNORM;
+    case DXGI_FORMAT_R16_UNORM: return DXGI_FORMAT_R16_UNORM;
+    case DXGI_FORMAT_R8G8_TYPELESS: case DXGI_FORMAT_R8G8_UNORM: return DXGI_FORMAT_R8G8_UNORM;
+    case DXGI_FORMAT_R16G16_UNORM: return DXGI_FORMAT_R16G16_UNORM;
+    case DXGI_FORMAT_R16G16_SNORM: return DXGI_FORMAT_R16G16_SNORM;
+    case DXGI_FORMAT_R16G16B16A16_UNORM: return DXGI_FORMAT_R16G16B16A16_UNORM;
+    case DXGI_FORMAT_R16G16B16A16_SNORM: return DXGI_FORMAT_R16G16B16A16_SNORM;
+    case DXGI_FORMAT_R8G8B8A8_SNORM: return DXGI_FORMAT_R8G8B8A8_SNORM;
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM: return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8A8_UNORM: return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS: case DXGI_FORMAT_B8G8R8X8_UNORM: return DXGI_FORMAT_B8G8R8X8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    case DXGI_FORMAT_R9G9B9E5_SHAREDEXP: return DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
     default: return DXGI_FORMAT_UNKNOWN;
     }
 }
@@ -2142,19 +2218,46 @@ void d3d_copy_inputs(Ctx* c, const Job& j) {
     for (int i = 0; i < G_COUNT; ++i)
         if (j.in[i].present && !j.in[i].direct)
             cp[n++] = {static_cast<ID3D12Resource*>(tex[i]->resource), tex[i]->state, j.in[i].offset, j.in[i].pitch, 0, 0};
-    if (n) c->dx->copy_textures_to_buffer(cp, n, c->dinput);
+    if (n) {
+        uint64_t end = 0;
+        for (int i = 0; i < G_COUNT; ++i)
+            if (j.in[i].present && !j.in[i].direct)
+                end = std::max<uint64_t>(end, j.in[i].offset + uint64_t(j.in[i].pitch) * j.in[i].th);
+        d3d_ensure(c, c->dinput, (end + 511) & ~uint64_t(511));
+        c->dx->copy_textures_to_buffer(cp, n, c->dinput);
+    }
 }
 
 // d3d_pack straight into the output: an rgba16f texture that takes a UAV (the store keeps the bits); r set up, the
 // texture moved into UNORDERED_ACCESS (back: the move to undo). False: the rows go through doutput and a copy.
+DXGI_FORMAT direct_uav_format(DXGI_FORMAT f) {
+    switch (f) {
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: case DXGI_FORMAT_R16G16B16A16_FLOAT: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS: case DXGI_FORMAT_R32G32B32A32_FLOAT: return DXGI_FORMAT_R32G32B32A32_FLOAT;
+    case DXGI_FORMAT_R11G11B10_FLOAT: return DXGI_FORMAT_R11G11B10_FLOAT;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: case DXGI_FORMAT_R10G10B10A2_UNORM: return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM: return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8A8_UNORM: return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS: case DXGI_FORMAT_B8G8R8X8_UNORM: return DXGI_FORMAT_B8G8R8X8_UNORM;
+    case DXGI_FORMAT_R16G16B16A16_UNORM: return DXGI_FORMAT_R16G16B16A16_UNORM;
+    default: return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
 bool d3d_direct_output(Ctx* c, const Job& j, Rec& r, std::vector<D3D12_RESOURCE_BARRIER>& back) {
     auto* out = static_cast<ID3D12Resource*>(j.f.output.resource);
     D3D12_RESOURCE_DESC od = out->GetDesc();
-    if (!c->direct_ok || j.out_tf != TF_RGBA16F || !(od.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) || od.SampleDesc.Count != 1 ||
-        j.f.output.x > 65535 || j.f.output.y > 65535)
+    const DXGI_FORMAT uav_fmt = direct_uav_format(od.Format);
+    if (!c->direct_ok || uav_fmt == DXGI_FORMAT_UNKNOWN || !(od.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ||
+        od.SampleDesc.Count != 1 || j.f.output.x > 65535 || j.f.output.y > 65535)
         return false;
-    c->dx->uav(out, 16, DXGI_FORMAT_R16G16B16A16_FLOAT);
-    r.out_fmt = TF_RGBA16F | 256u, r.out_pitch = j.f.output.x | j.f.output.y << 16;
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT fs{uav_fmt};
+    if (FAILED(c->d3d->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof fs)) ||
+        !(fs.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) ||
+        !(fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE))
+        return false;
+    c->dx->uav(out, 16, uav_fmt);
+    r.out_fmt = uint32_t(j.out_tf) | 256u, r.out_pitch = j.f.output.x | j.f.output.y << 16;
     const auto st = D3D12_RESOURCE_STATES(j.f.output.state);
     if (st != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
         D3D12_RESOURCE_BARRIER b{D3D12_RESOURCE_BARRIER_TYPE_TRANSITION};
@@ -2186,6 +2289,7 @@ int32_t Record(void* ctx, const OnrRrFrame* f, void* list, uint32_t edit, OnrRrD
     if (image) image->buffer = nullptr;
     auto* c = static_cast<Ctx*>(ctx);
     auto* cl = static_cast<ID3D12GraphicsCommandList*>(list);
+    sweep_retired();
     std::lock_guard l(c->m);
     if (!c->use_d3d) return fail(ONR_RR_UNSUPPORTED, c->vk_host ? "Record: the Vulkan host backend runs, use RecordVk" : "Record: the Vulkan backend runs");
     D3dDevice& d = *c->dx;
@@ -2201,8 +2305,8 @@ int32_t Record(void* ctx, const OnrRrFrame* f, void* list, uint32_t edit, OnrRrD
         const bool was_ready = c->state == ONR_RR_STATE_READY;
         // our buffers outlive the lists that use them by D3dDevice's deferred release, so nothing waits here
         const bool network = prepare_network(c, d, render, [] {});
-        d3d_ensure(c, c->dinput, in_bytes);
-        d3d_ensure(c, c->doutput, out_bytes);
+        // dinput and doutput are allocated on demand below only when a texture is not read/written directly.
+        (void)out_bytes;
         const bool hop = network && was_ready && image && (edit == ONR_RR_EDIT_LOOP || edit == ONR_RR_EDIT_DISPLAY);
         if (hop) {
             j->edit = edit;
@@ -2216,10 +2320,13 @@ int32_t Record(void* ctx, const OnrRrFrame* f, void* list, uint32_t edit, OnrRrD
             g_log("denoised image hop: %s", c->logged_edit == ONR_RR_EDIT_LOOP ? "loop" : c->logged_edit == ONR_RR_EDIT_DISPLAY ? "display" : "off");
         }
 
-        const uint32_t slot = uint32_t(c->drecords++ % D3dDevice::kSlots);
-        d3d_harvest(c, slot);
-        d.bind(cl, slot);
-        Rec r{d, c->dkern, c->dinput.addr, c->doutput.addr, c->dimage.addr, c->dqnet[slot]};
+        const uint32_t hint = uint32_t(c->drecords++ % D3dDevice::kGameSlots);
+        d3d_harvest(c);
+        const uint64_t serial = d.bind(cl, hint);
+        const uint32_t slot = d.bound_slot();
+        const bool overflow = d.using_overflow();
+        uint32_t dummy_qnet[2] = {};
+        Rec r{d, c->dkern, c->dinput.addr, c->doutput.addr, c->dimage.addr, overflow ? dummy_qnet : c->dqnet[slot]};
         std::vector<D3D12_RESOURCE_BARRIER> back;
         try {
             d.stamp();
@@ -2228,7 +2335,12 @@ int32_t Record(void* ctx, const OnrRrFrame* f, void* list, uint32_t edit, OnrRrD
                 d3d_plan_direct(c, *j, back);
             }
             d3d_copy_inputs(c, *j);
+            r.input = c->dinput.addr;
             const bool direct_out = !hop && d3d_direct_output(c, *j, r, back);
+            if (!direct_out && !hop) {
+                d3d_ensure(c, c->doutput, out_bytes);
+                r.output = c->doutput.addr;
+            }
             record_frame(c, r, *j, network, hop);
             if (!hop) {
                 if (direct_out) d.barrier();
@@ -2237,16 +2349,20 @@ int32_t Record(void* ctx, const OnrRrFrame* f, void* list, uint32_t edit, OnrRrD
             }
             if (!back.empty()) cl->ResourceBarrier(UINT(back.size()), back.data());
         } catch (...) {
-            c->dq[slot] = 0;
+            if (!overflow) c->dq[slot] = 0;
             d.unbind();
             throw;
         }
         // a hop's times come with its RecordPost
-        c->dq[slot] = hop ? 0 : d.queries();
-        if (g_stamps && !hop && network) c->stamp_names = d.stamp_names;
+        if (!overflow) c->dq[slot] = hop ? 0 : d.queries();
+        if (g_stamps && !hop && !overflow && network) c->stamp_names = d.stamp_names;
         d.unbind();
         if (network) log_frame(c, render);
-        if (!hop) return ONR_RR_OK;
+        if (!hop) {
+            if (g_abi6_host.load(std::memory_order_relaxed) && edit == ONR_RR_EDIT_OFF && !image)
+                *job = reinterpret_cast<void*>(uintptr_t(serial));
+            return ONR_RR_OK;
+        }
         j->d3d = true;
         j->post_pending = true;
         image->buffer = c->dimage.res;
@@ -2283,25 +2399,33 @@ int32_t RecordPost(void* ctx, void* job, void* list, uint32_t format) {
             if (!std::exchange(said, true)) g_log("RecordPost: edit format %u is not read; the network's image is used", format);
             tf = TF_NONE;
         }
-        const uint32_t slot = uint32_t(c->drecords++ % D3dDevice::kSlots);
-        d3d_harvest(c, slot);
-        d.bind(static_cast<ID3D12GraphicsCommandList*>(list), slot);
-        Rec r{d, c->dkern, c->dinput.addr, c->doutput.addr, c->dimage.addr, c->dqnet[slot]};
+        const uint32_t hint = uint32_t(c->drecords++ % D3dDevice::kGameSlots);
+        d3d_harvest(c);
+        d.bind(static_cast<ID3D12GraphicsCommandList*>(list), hint);
+        const uint32_t slot = d.bound_slot();
+        const bool overflow = d.using_overflow();
+        uint32_t dummy_qnet[2] = {};
+        Rec r{d, c->dkern, c->dinput.addr, c->doutput.addr, c->dimage.addr, overflow ? dummy_qnet : c->dqnet[slot]};
         std::vector<D3D12_RESOURCE_BARRIER> back;
         try {
             d.stamp();
             if (c->direct_ok) r.pack = "d3d_pack";
             const bool direct_out = d3d_direct_output(c, j, r, back);
+            if (!direct_out) {
+                d3d_ensure(c, c->doutput, j.out_bytes);
+                r.output = c->doutput.addr;
+            }
             record_post(c, r, j, tf);
             if (direct_out) d.barrier();
             else d3d_copy_output(c, j);
             d.stamp();
             if (!back.empty()) d.list()->ResourceBarrier(UINT(back.size()), back.data());
         } catch (...) {
+            if (!overflow) c->dq[slot] = 0;
             d.unbind();
             throw;
         }
-        c->dq[slot] = d.queries();
+        if (!overflow) c->dq[slot] = d.queries();
         d.unbind();
     } catch (const std::exception& e) {
         if (c->state != ONR_RR_STATE_FAILED) {
@@ -2442,25 +2566,27 @@ int32_t RecordOutput(void* ctx, void* job, void* list) {
 
 // ------------------------------------------------------------------------------------------------ Vulkan host backend
 
-// a slot's timestamps once its command buffer ran (8 recordings later); nothing while they are not written
-void vk_harvest(Ctx* c, uint32_t slot) {
-    const uint32_t n = c->hq[slot];
-    c->hq[slot] = 0;
-    if (n < 2) return;
-    std::vector<uint64_t> ts(n);
-    if (vkGetQueryPoolResults(c->dev.vk(), c->hqp[slot], 0, n, ts.size() * 8, ts.data(), 8, VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) return;
+// a slot's timestamps once its command buffer ran; nothing while they are not written
+void vk_harvest(Ctx* c) {
     const double ms = c->dev.timestamp_period_ns() * 1e-6;
-    add_gaps(c, ts, ms);
-    const uint32_t a = c->hqnet[slot][0], b = c->hqnet[slot][1];
-    if (b > a && b <= n) {
-        c->split[0] += float(double(ts[a] - ts.front()) * ms);
-        c->split[1] += float(double(ts[b - 1] - ts[a]) * ms);
-        c->split[2] += float(double(ts.back() - ts[b - 1]) * ms);
-        ++c->split_n;
+    for (uint32_t slot = 0; slot < Ctx::kHostSlots; ++slot) {
+        const uint32_t n = c->hq[slot];
+        if (n < 2 || !c->hqp[slot] || !c->dev.pool_retired(c->hqp[slot])) continue;
+        c->hq[slot] = 0;
+        std::vector<uint64_t> ts(n);
+        if (vkGetQueryPoolResults(c->dev.vk(), c->hqp[slot], 0, n, ts.size() * 8, ts.data(), 8, VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) continue;
+        add_gaps(c, ts, ms);
+        const uint32_t a = c->hqnet[slot][0], b = c->hqnet[slot][1];
+        if (b > a && b <= n) {
+            c->split[0] += float(double(ts[a] - ts.front()) * ms);
+            c->split[1] += float(double(ts[b - 1] - ts[a]) * ms);
+            c->split[2] += float(double(ts.back() - ts[b - 1]) * ms);
+            ++c->split_n;
+        }
+        c->gpu_last = float(double(ts.back() - ts.front()) * ms);
+        c->gpu_hist.push_back(c->gpu_last);
+        if (c->gpu_hist.size() > 64) c->gpu_hist.erase(c->gpu_hist.begin());
     }
-    c->gpu_last = float(double(ts.back() - ts.front()) * ms);
-    c->gpu_hist.push_back(c->gpu_last);
-    if (c->gpu_hist.size() > 64) c->gpu_hist.erase(c->gpu_hist.begin());
 }
 
 void vk_ensure(Ctx* c, Buffer& b, UINT64 n) {
@@ -2668,11 +2794,26 @@ int32_t RecordVk(void* ctx, const OnrRrFrame* f, void* cmd) {
         const bool network = prepare_network(c, d, render, [] {});
         vk_ensure(c, c->vinput, in_bytes);
         vk_ensure(c, c->voutput, out_bytes);
-        const uint32_t slot = uint32_t(c->hrecords++ % Ctx::kHostSlots);
-        vk_harvest(c, slot);
-        d.bind(cb, c->hqp[slot]);
+        vk_harvest(c);
+        const uint32_t hint = uint32_t(c->hrecords++ % Ctx::kHostSlots);
+        uint32_t slot = UINT32_MAX;
+        for (uint32_t i = 0; i < Ctx::kHostSlots; ++i) {
+            const uint32_t cand = (hint + i) % Ctx::kHostSlots;
+            if (!c->hqp[cand] || d.pool_retired(c->hqp[cand])) {
+                slot = cand;
+                break;
+            }
+        }
+        if (slot < Ctx::kHostSlots && !c->hqp[slot]) {
+            VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            qi.queryCount = kMaxQueries;
+            if (vkCreateQueryPool(d.vk(), &qi, nullptr, &c->hqp[slot]) != VK_SUCCESS) throw std::runtime_error("vkCreateQueryPool");
+        }
+        d.bind(cb, slot < Ctx::kHostSlots ? c->hqp[slot] : VK_NULL_HANDLE);
         d.use_views(slot);
-        Rec r{d, c->kern, c->vinput.addr, c->voutput.addr, 0, c->hqnet[slot]};
+        uint32_t dummy_qnet[2] = {};
+        Rec r{d, c->kern, c->vinput.addr, c->voutput.addr, 0, slot < Ctx::kHostSlots ? c->hqnet[slot] : dummy_qnet};
         try {
             d.stamp();
             if (c->direct_ok) {
@@ -2686,11 +2827,11 @@ int32_t RecordVk(void* ctx, const OnrRrFrame* f, void* cmd) {
             else vk_copy_output(c, *j, cb);
             d.stamp();
         } catch (...) {
-            c->hq[slot] = 0;
+            if (slot < Ctx::kHostSlots) c->hq[slot] = 0;
             d.unbind();
             throw;
         }
-        c->hq[slot] = d.queries();
+        if (slot < Ctx::kHostSlots) c->hq[slot] = d.queries();
         d.unbind();
         if (network) log_frame(c, render);
         return ONR_RR_OK;
@@ -2778,6 +2919,22 @@ int32_t GetHopTiming(void* ctx, uint64_t hop, OnrRrHopTiming* t) {
     return ONR_RR_OK;
 }
 
+int32_t NoteD3d12Fence(void* ctx, uint64_t serial, void* fence, uint64_t value) {
+    if (!ctx || !serial) return ONR_RR_INVALID_ARGUMENT;
+    auto* c = static_cast<Ctx*>(ctx);
+    std::lock_guard l(c->m);
+    if (c->dx) c->dx->note_fence(serial, static_cast<ID3D12Fence*>(fence), value);
+    return ONR_RR_OK;
+}
+
+int32_t NoteD3d12Invalidated(void* ctx, uint64_t serial) {
+    if (!ctx || !serial) return ONR_RR_INVALID_ARGUMENT;
+    auto* c = static_cast<Ctx*>(ctx);
+    std::lock_guard l(c->m);
+    if (c->dx) c->dx->note_invalidated(serial);
+    return ONR_RR_OK;
+}
+
 int32_t GetLastErrorText(char* buf, uint32_t n) {
     if (buf && n) copy_str(buf, n, t_error);
     return ONR_RR_OK;
@@ -2808,7 +2965,13 @@ extern "C" int32_t OnrRrSetDeltaRate(void* context, float rate) {
 }
 
 extern "C" int32_t OnrRrGetApi(uint32_t abi, OnrRrApi* api) {
-    if (abi < ONR_RR_ABI_VERSION || abi > ONR_RR_ABI_VERSION_5 || !api) return ONR_RR_INVALID_ARGUMENT;
+    if (abi < ONR_RR_ABI_VERSION || abi > ONR_RR_ABI_VERSION_6 || !api) return ONR_RR_INVALID_ARGUMENT;
+    if (abi >= ONR_RR_ABI_VERSION_6) {
+        g_abi6_host.store(true, std::memory_order_relaxed);
+        auto* a6 = reinterpret_cast<OnrRrApi6*>(api);
+        a6->NoteD3d12Fence = NoteD3d12Fence;
+        a6->NoteD3d12Invalidated = NoteD3d12Invalidated;
+    }
     if (abi >= ONR_RR_ABI_VERSION_5) {
         auto* a5 = reinterpret_cast<OnrRrApi5*>(api);
         a5->PrepareVkDevice = PrepareVkDevice;
